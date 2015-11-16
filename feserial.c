@@ -1,12 +1,22 @@
 /* vim: set nolist ts=8 sw=8 : */
 
 #include <asm/io.h> /* readl, writel */
+#include <asm/uaccess.h>
+#include <linux/file.h>
+#include <linux/fs.h> /* file_operations */
 #include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/utsname.h>
+#include <linux/miscdevice.h> /* miscdevice */
 #include <linux/module.h>
 #include <linux/of.h> /*of_property_read_u32 */
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/serial_reg.h> /* serial register macros */
+
+#define RW_BUF_SIZE 64
+#define SERIAL_RESET_COUNTER 0
+#define SERIAL_GET_COUNTER 1
 
 /* table of compatible devices */
 static const struct of_device_id fes_of_ids[] = {
@@ -16,8 +26,120 @@ static const struct of_device_id fes_of_ids[] = {
 
 /* private device structure */
 struct feserial_dev {
+	struct platform_device *pdev;
+	struct miscdevice miscdev;
 	void __iomem *regs;
+	unsigned long xmit_cnt;
 };
+
+static unsigned int reg_read(struct feserial_dev *, int);
+static void reg_write(struct feserial_dev *, int, int);
+
+static void uart_char_tx(struct feserial_dev *fesdev, char c)
+{
+	while((reg_read(fesdev, UART_LSR) & UART_LSR_THRE) == 0x00) {
+		cpu_relax();
+	}
+
+	reg_write(fesdev, c, UART_TX);
+	fesdev->xmit_cnt++;
+}
+
+static void uart_write(struct feserial_dev *dev, char * ubuff, size_t size)
+{
+	int i;
+	for (i = 0; i < size; i++) {
+		uart_char_tx(dev, ubuff[i]);
+		if (ubuff[i] == '\n')
+			uart_char_tx(dev, '\r');
+	}
+}
+
+/* file operations */
+static ssize_t feserial_read(struct file *f, char __user *buf, size_t count,
+	loff_t *ppos)
+{
+	return -EINVAL;
+}
+
+/* file is in userspace ! */
+static ssize_t feserial_write(struct file *f, const char __user *buf,
+	size_t size, loff_t *off)
+{
+	char kbuf[RW_BUF_SIZE];
+	unsigned int chunk = RW_BUF_SIZE;
+
+	size_t left_to_copy = size;
+	ssize_t copied = 0;
+
+	struct feserial_dev *dev;
+
+	/* get the feserial_dev structure from file */
+	if (f->private_data == NULL)
+	{
+		pr_err("private_data is empty!\n");
+		return -1;
+	}
+	dev = container_of(f->private_data, struct feserial_dev, miscdev);
+	if (dev == NULL)
+	{
+		pr_err("could not retrieve miscdev structure\n");
+	}
+
+	while (left_to_copy > 0) {
+		if (size < RW_BUF_SIZE)
+			chunk = (unsigned int) size;
+
+		if (copy_from_user(kbuf, buf, chunk)) {
+			pr_err("copy_from_user failed\n");
+			return -1;
+		}
+
+		left_to_copy -= chunk;
+		uart_write(dev, kbuf, chunk);
+		copied += chunk;
+	}
+
+	return copied;
+}
+
+static long feserial_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct feserial_dev *dev;
+	void __user *argp = (void __user *) arg;
+
+	dev = container_of(f->private_data, struct feserial_dev, miscdev);
+
+	switch(cmd) {
+	case SERIAL_RESET_COUNTER:
+		dev->xmit_cnt = 0;
+		break;
+	case SERIAL_GET_COUNTER:
+		if (copy_to_user(argp, &dev->xmit_cnt, sizeof(dev->xmit_cnt)))
+			return -EFAULT;
+		break;
+	default:
+		return -ENOTTY;
+	}
+	return 0;
+}
+
+/*
+ * need a open operation to be defined in order to access data field
+ * file->private_data
+ */
+static int feserial_open(struct inode *i, struct file *f)
+{
+	return 0;
+}
+
+static const struct file_operations fes_fops = {
+	.read = feserial_read,
+	.write = feserial_write,
+	.unlocked_ioctl = feserial_ioctl,
+	.open = feserial_open,
+};
+/* end of file operations */
 
 static unsigned int reg_read(struct feserial_dev *fesdev, int offset)
 {
@@ -29,21 +151,18 @@ static void reg_write(struct feserial_dev *fesdev, int val, int offset)
 	writel(val, fesdev->regs + 4*offset);
 }
 
-static void test_write(struct feserial_dev *fesdev, char c)
-{
-	while((reg_read(fesdev, UART_LSR) & UART_LSR_THRE) == 0x00) {
-		cpu_relax();
-	}
-	reg_write(fesdev, c, UART_TX);
-}
-
 static int feserial_probe(struct platform_device *pdev)
 {
 	struct resource *res;
 	struct feserial_dev *dev;
 	unsigned int baud_divisor, uartclk;
+	int retval;
 
-	pr_info("Called feserial_probe\n");
+	pr_info("Called feserial_probe (v%s)\n", utsname()->release);
+
+	/* enable device-level Power Management */
+	pm_runtime_enable(&pdev->dev);
+	pm_runtime_get_sync(&pdev->dev);
 
 	/*
 	 * see include/linux/ioport.h,
@@ -55,7 +174,6 @@ static int feserial_probe(struct platform_device *pdev)
 		pr_err("Unable to obtain platform memory resource\n");
 		return -1;
 	}
-	pr_info("device is located at physical address 0x%x\n", res->start);
 
 	/*
 	 * memory allocated with devm_* is associated with the device. When
@@ -63,8 +181,12 @@ static int feserial_probe(struct platform_device *pdev)
 	 * parameter is Get Free Page (GFP) Flags structure
 	*/
 	dev = devm_kzalloc(&pdev->dev, sizeof(struct feserial_dev), GFP_KERNEL);
-	if (!dev)
+	if (!dev) {
 		pr_err("Unable to obtain kernel memory\n");
+		return -ENOMEM;
+	}
+	dev->pdev = pdev;
+	dev->xmit_cnt = 0;
 
 	/*
 	 * map physical memory associated with the resource to kernel
@@ -76,9 +198,14 @@ static int feserial_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	/* enable device-level Power Management */
-	pm_runtime_enable(&pdev->dev);
-	pm_runtime_get_sync(&pdev->dev);
+	/* misc device registration */
+	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+	dev->miscdev.name = kasprintf(GFP_KERNEL, "feserial-%x",
+		res->start);
+	dev->miscdev.fops = &fes_fops;
+	platform_set_drvdata(pdev, dev);
+
+	dev = (struct feserial_dev *) platform_get_drvdata(pdev);
 
 	/* Baud-rate configuration */
 	of_property_read_u32(pdev->dev.of_node, "clock-frequency", &uartclk);
@@ -94,22 +221,27 @@ static int feserial_probe(struct platform_device *pdev)
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 	reg_write(dev, 0x00, UART_OMAP_MDR1);
 
-	/* test write */
-	test_write(dev, 's');
-	test_write(dev, 't');
-	test_write(dev, 'e');
-	test_write(dev, 'p');
-	test_write(dev, 'h');
-	test_write(dev, 'e');
-	test_write(dev, 'n');
-	test_write(dev, '\n');
+	retval = misc_register(&dev->miscdev);
+	if (retval != 0) {
+		pr_err("Failed to register misc console\n");
+		return -ENODEV;
+	}
+
 	return 0;
 }
 
 static int feserial_remove(struct platform_device *pdev)
 {
+	struct feserial_dev *dev;
 	pr_info("Called feserial_remove\n");
 	pm_runtime_disable(&pdev->dev);
+	dev = platform_get_drvdata(pdev);
+	if (dev == NULL) {
+		pr_err("Platform feserial_dev data is empty!\n");
+		return -ENODEV;
+	}
+	misc_deregister(&dev->miscdev);
+	kfree(dev->miscdev.name);
 	return 0;
 }
 

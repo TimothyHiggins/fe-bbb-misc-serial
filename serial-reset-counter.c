@@ -1,3 +1,4 @@
+// arm-linux-gnueabi-gcc -static -o serial-reset-counter serial-reset-counter.c
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -12,7 +13,7 @@ int main(void)
 {
     int fd, ret;
 
-    fd = open("/dev/serial", O_RDWR);
+    fd = open("/dev/feserial-48024000", O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "Unable to open /dev/serial\n");
         exit (1);
