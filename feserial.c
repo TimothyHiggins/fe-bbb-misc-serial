@@ -5,6 +5,8 @@
 #include <linux/file.h>
 #include <linux/fs.h> /* file_operations */
 #include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/irqreturn.h>
 #include <linux/slab.h>
 #include <linux/utsname.h>
 #include <linux/miscdevice.h> /* miscdevice */
@@ -13,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/serial_reg.h> /* serial register macros */
+#include <linux/wait.h>
 
 #define RW_BUF_SIZE 64
 #define SERIAL_RESET_COUNTER 0
@@ -30,6 +33,10 @@ struct feserial_dev {
 	struct miscdevice miscdev;
 	void __iomem *regs;
 	unsigned long xmit_cnt;
+	int irq;
+	char cbuf[RW_BUF_SIZE];
+	int cr, cw;
+	wait_queue_head_t serial_wait;
 };
 
 static unsigned int reg_read(struct feserial_dev *, int);
@@ -45,25 +52,43 @@ static void uart_char_tx(struct feserial_dev *fesdev, char c)
 	fesdev->xmit_cnt++;
 }
 
-static void uart_write(struct feserial_dev *dev, char * ubuff, size_t size)
+static void uart_write(struct feserial_dev *dev, char * ubuf, size_t size)
 {
 	int i;
 	for (i = 0; i < size; i++) {
-		uart_char_tx(dev, ubuff[i]);
-		if (ubuff[i] == '\n')
+		uart_char_tx(dev, ubuf[i]);
+		if (ubuf[i] == '\n')
 			uart_char_tx(dev, '\r');
 	}
 }
 
 /* file operations */
-static ssize_t feserial_read(struct file *f, char __user *buf, size_t count,
-	loff_t *ppos)
+static ssize_t feserial_read(struct file *f, char __user *ubuf, size_t size,
+	loff_t *off)
 {
-	return -EINVAL;
+	struct feserial_dev *fdev;
+	char c;
+	char r = '\r';
+
+	fdev = container_of(f->private_data, struct feserial_dev, miscdev);
+	wait_event_interruptible(fdev->serial_wait,
+		fdev->cr != fdev->cw);
+
+	if (fdev->cr != fdev->cw) {
+		c = fdev->cbuf[fdev->cr++];
+		//pr_info("reading %c\n", c);
+		if (copy_to_user(ubuf, &c, 1)) {
+			pr_err("copy_to_user failed\n");
+			return -EINVAL;
+		}
+		if (fdev->cr == RW_BUF_SIZE)
+			fdev->cr = 0;
+	}
+	return 1; // read 1 byte at a time
 }
 
 /* file is in userspace ! */
-static ssize_t feserial_write(struct file *f, const char __user *buf,
+static ssize_t feserial_write(struct file *f, const char __user *ubuf,
 	size_t size, loff_t *off)
 {
 	char kbuf[RW_BUF_SIZE];
@@ -90,7 +115,7 @@ static ssize_t feserial_write(struct file *f, const char __user *buf,
 		if (size < RW_BUF_SIZE)
 			chunk = (unsigned int) size;
 
-		if (copy_from_user(kbuf, buf, chunk)) {
+		if (copy_from_user(kbuf, ubuf, chunk)) {
 			pr_err("copy_from_user failed\n");
 			return -1;
 		}
@@ -141,6 +166,21 @@ static const struct file_operations fes_fops = {
 };
 /* end of file operations */
 
+static irqreturn_t feserial_handler(int irq, void *dev)
+{
+	struct feserial_dev *fdev;
+
+	fdev = (struct feserial_dev*) dev;
+	fdev->cbuf[fdev->cw] = (char) reg_read(fdev, UART_RX);
+
+	fdev->cw++;
+	if (fdev->cw == RW_BUF_SIZE)
+		fdev->cw = 0;
+
+	wake_up(&fdev->serial_wait);
+	return IRQ_HANDLED;
+}
+
 static unsigned int reg_read(struct feserial_dev *fesdev, int offset)
 {
 	return readl(fesdev->regs + 4*offset);
@@ -188,6 +228,18 @@ static int feserial_probe(struct platform_device *pdev)
 	dev->pdev = pdev;
 	dev->xmit_cnt = 0;
 
+	/* register receive interrupt handler */
+	dev->irq = platform_get_irq(pdev, 0);
+	retval = devm_request_irq(&pdev->dev, dev->irq, feserial_handler, 0,
+		pdev->name, dev);
+
+	/* recieve buffer initialization */
+	dev->cr = 0;
+	dev->cw = 0;
+
+	/* initialize wait queue! */
+	init_waitqueue_head(&dev->serial_wait);
+
 	/*
 	 * map physical memory associated with the resource to kernel
 	 * virtual address space
@@ -216,6 +268,7 @@ static int feserial_probe(struct platform_device *pdev)
 	reg_write(dev, baud_divisor & 0xff, UART_DLL);
 	reg_write(dev, (baud_divisor >> 8) & 0xff, UART_DLM);
 	reg_write(dev, UART_LCR_WLEN8, UART_LCR);
+	reg_write(dev, UART_IER_RDI, UART_IER);
 
 	/* trigger a soft reset */
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
